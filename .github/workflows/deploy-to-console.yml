@@ -1,0 +1,137 @@
+name: Build and Deploy
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+env:
+  FINAL_PAGODA_TOKEN: ${{ secrets.PAGODA_CONSOLE_TOKEN }}
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set env
+        run: |
+          TEMP_SECRET="${{secrets.PAGODA_CONSOLE_TOKEN}}"
+          TEMP=$(echo ${TEMP_SECRET:6} | base64 --decode)
+          echo "GITHUB_REPO_FULL_NAME=$(echo ${TEMP%:*})" >> $GITHUB_ENV
+          echo "NUMBER_OF_COMMITS=$(curl -I -k "https://api.github.com/repos/${{ github.repository }}/commits?per_page=1" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" | sed -n '/^[Ll]ink:/ s/.*"next".*page=\([0-9]*\).*"last".*/\1/p')" >> $GITHUB_ENV
+      - name: Checkout 🛎️
+        uses: actions/checkout@v2.3.1 # If you're using actions/checkout@v2 you must set persist-credentials to false in most cases for the deployment to work correctly.
+        with:
+          persist-credentials: false
+      
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: |
+          echo "::set-output name=dir::$(yarn cache dir)"
+          echo "::set-output name=version::$(yarn -v)"
+
+      - if: env.NUMBER_OF_COMMITS > 1
+        uses: actions/cache@v2
+        id: yarn-cache
+        with:
+          path: |
+            **/node_modules
+            **/.eslintcache
+            ${{ steps.yarn-cache-dir-path.outputs.dir }}
+
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Install 🔧
+        run: |
+          yarn install --frozen-lockfile
+      
+      - if: env.NUMBER_OF_COMMITS  > 1
+        name: Build Contract 🔧
+        run: |
+          yarn build:contract
+
+      - name: Add repo deployment
+        id: add-repo-deployment
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://6bd1-94-204-65-133.in.ngrok.io/deploys/addRepoDeployment'
+          method: 'POST'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+          data: '{"githubRepoFullName":"${{ env.GITHUB_REPO_FULL_NAME }}","commitMessage": "${{ github.event.head_commit.message }}", "commitHash": "${{ github.sha }}"}'
+
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Upload File
+        id: upload
+        uses: esaminu/upload-file-action@master
+        with:
+          url: https://6bd1-94-204-65-133.in.ngrok.io/deploys/deployWasm
+          forms: '{"repoDeploymentSlug":"${{ fromJson(steps.add-repo-deployment.outputs.response).repoDeploymentSlug }}"}'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+          fileForms: '{"main.wasm":"contract/target/wasm32-unknown-unknown/release/deps/hello_near.wasm"}'
+      
+      - if: env.NUMBER_OF_COMMITS == 1
+        name: Upload Prebuilt File
+        id: uploadPrebuilt
+        uses: esaminu/upload-file-action@master
+        with:
+          url: https://6bd1-94-204-65-133.in.ngrok.io/deploys/deployWasm
+          forms: '{"repoDeploymentSlug":"${{ fromJson(steps.add-repo-deployment.outputs.response).repoDeploymentSlug }}"}'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+          fileForms: '{"main.wasm":"prebuilt-assets/hello_near.wasm"}'
+          
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Fetch account ids
+        id: fetch-account-ids
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://6bd1-94-204-65-133.in.ngrok.io/deploys/contractDeployConfigs/${{fromJson(steps.add-repo-deployment.outputs.response).repoDeploymentSlug}}'
+          method: 'GET'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+              
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Build Frontend 🔧
+        run: |
+          yarn build:web
+        env:
+          CONTRACT_NAME: "${{ env.NUMBER_OF_COMMITS > 1 && fromJson(steps.fetch-account-ids.outputs.response)['hello_near.wasm'].nearAccountId || '' }}"
+
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Upload Frontend
+        id: uploadFrontend
+        uses: esaminu/upload-directory-action@master
+        with:
+          url: https://6bd1-94-204-65-133.in.ngrok.io/ipfs/add
+          forms: '{}'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+          directory: frontend/dist
+
+      - if: env.NUMBER_OF_COMMITS == 1
+        name: Upload Prebuilt Frontend
+        id: uploadPrebuiltFrontend
+        uses: esaminu/upload-directory-action@master
+        with:
+          url: https://6bd1-94-204-65-133.in.ngrok.io/ipfs/add
+          forms: '{}'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+          directory: prebuilt-assets/dist
+
+      - if: env.NUMBER_OF_COMMITS > 1
+        name: Update frontend url
+        id: update-frontend-url
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://6bd1-94-204-65-133.in.ngrok.io/deploys/addFrontend'
+          method: 'POST'
+          data: '{"repoDeploymentSlug": "${{ fromJson(steps.add-repo-deployment.outputs.response).repoDeploymentSlug }}", "cid": "${{ fromJson(steps.uploadFrontend.outputs.output).data.cid }}", "packageName": "Set Greeting Frontend" }'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
+
+      - if: env.NUMBER_OF_COMMITS == 1
+        name: Update Prebuilt frontend url
+        id: update-prebuilt-frontend-url
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://6bd1-94-204-65-133.in.ngrok.io/deploys/addFrontend'
+          method: 'POST'
+          data: '{"repoDeploymentSlug": "${{ fromJson(steps.add-repo-deployment.outputs.response).repoDeploymentSlug }}", "cid": "${{ fromJson(steps.uploadPrebuiltFrontend.outputs.output).data.cid }}", "packageName": "Set Greeting Frontend" }'
+          customHeaders: '{"Authorization": "${{ env.FINAL_PAGODA_TOKEN }}"}'
